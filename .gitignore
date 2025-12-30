@@ -1,1 +1,6 @@
 frontend/node_modules
+.claude
+docs/
+CLAUDE.md
+STEAM_API_MIGRATION.md
+.env
