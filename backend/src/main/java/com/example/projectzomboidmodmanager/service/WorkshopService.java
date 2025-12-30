@@ -1,9 +1,7 @@
 package com.example.projectzomboidmodmanager.service;
 
+import com.example.projectzomboidmodmanager.dto.SteamPublishedFileDetails;
 import com.example.projectzomboidmodmanager.model.ModDetails;
-import org.jsoup.Jsoup;
-import org.jsoup.nodes.Document;
-import org.jsoup.nodes.Element;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
@@ -18,17 +16,20 @@ import java.util.regex.Pattern;
 public class WorkshopService {
 
     @Value("${workshop.collection.url}")
-    private String collectionUrlTemplate;  // Environment variable for the collection URL template
-    @Value("${workshop.mod.url}")
-    private String modUrlTemplate;  // Environment variable for the mod URL template
+    private String collectionUrlTemplate;
 
     private final RestTemplate restTemplate;
+    private final SteamApiService steamApiService;
 
-    public WorkshopService(RestTemplate restTemplate) {
+    public WorkshopService(RestTemplate restTemplate, SteamApiService steamApiService) {
         this.restTemplate = restTemplate;
+        this.steamApiService = steamApiService;
     }
 
-    // Extracts individual Workshop item IDs from a collection page.
+    /**
+     * Extracts individual Workshop item IDs from a collection page.
+     * NOTE: This must use HTML scraping as there is no Steam API for collections.
+     */
     public List<String> getWorkshopIds(String collectionId) {
         List<String> workshopIds = new ArrayList<>();
         String collectionUrl = String.format(collectionUrlTemplate, collectionId);
@@ -36,7 +37,7 @@ public class WorkshopService {
         try {
             String htmlContent = restTemplate.getForObject(collectionUrl, String.class);
             if (htmlContent != null) {
-                Pattern pattern = Pattern.compile("id=\"sharedfile_(\\d+)\"");  // Regex to extract workshop IDs
+                Pattern pattern = Pattern.compile("id=\"sharedfile_(\\d+)\"");
                 Matcher matcher = pattern.matcher(htmlContent);
 
                 while (matcher.find()) {
@@ -49,107 +50,125 @@ public class WorkshopService {
         return workshopIds;
     }
 
-    // Asynchronous method to get mod details for a list of workshopIds
+    /**
+     * Asynchronous method to get mod details for a list of workshopIds.
+     * Now uses Steam API batch request for improved performance.
+     */
     @Async
     public CompletableFuture<List<ModDetails>> getModDetails(List<String> workshopIds) {
-        List<CompletableFuture<ModDetails>> futures = new ArrayList<>();
+        return CompletableFuture.supplyAsync(() -> {
+            List<ModDetails> modDetailsList = new ArrayList<>();
 
-        for (String workshopId : workshopIds) {
-            CompletableFuture<ModDetails> future = CompletableFuture.supplyAsync(() -> {
-                return fetchModDetails(workshopId);
-            });
-            futures.add(future);
-        }
+            // Use batch API call for all mods at once
+            List<SteamPublishedFileDetails> apiDetails = steamApiService.fetchBatchModDetails(workshopIds);
 
-        // Wait for all futures to complete and gather the results
-        return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
-                .thenApply(v -> {
-                    List<ModDetails> modDetailsList = new ArrayList<>();
-                    for (CompletableFuture<ModDetails> future : futures) {
-                        try {
-                            modDetailsList.add(future.get());  // Get the result of each future
-                        } catch (Exception e) {
-                            modDetailsList.add(new ModDetails(null, null, null, null));  // Add default ModDetails in case of failure
+            // Map API response to ModDetails, maintaining original order
+            for (int i = 0; i < workshopIds.size(); i++) {
+                String workshopId = workshopIds.get(i);
+
+                // Find matching API response
+                SteamPublishedFileDetails details = null;
+                if (i < apiDetails.size()) {
+                    details = apiDetails.get(i);
+                }
+
+                // Check if this workshopId matches (API may return in different order)
+                if (details != null && workshopId.equals(details.getPublishedfileid())) {
+                    modDetailsList.add(parseSteamApiDetails(details));
+                } else {
+                    // Search for matching workshopId in the list
+                    boolean found = false;
+                    for (SteamPublishedFileDetails d : apiDetails) {
+                        if (workshopId.equals(d.getPublishedfileid())) {
+                            modDetailsList.add(parseSteamApiDetails(d));
+                            found = true;
+                            break;
                         }
                     }
-                    return modDetailsList;
-                });
-    }
-
-    // Helper method to fetch mod details from the HTML content
-    private ModDetails fetchModDetails(String workshopId) {
-        String url = modUrlTemplate + workshopId;
-        rateLimit();
-        try {
-            // Fetch the HTML content for the mod's Steam Workshop page
-            String htmlContent = restTemplate.getForObject(url, String.class);
-            if (htmlContent != null) {
-                // Extract mod name from HTML content
-                String modName = collectModNames(htmlContent);
-                // Extract maps from HTML content
-                Set<String> modMaps = new HashSet<>();
-                collectMaps(htmlContent, modMaps);
-
-                if (modName != null) {
-                    // Success: create ModDetails object with modName and maps
-                    return new ModDetails(modName, workshopId, List.copyOf(modMaps), getWorkshopThumbnail(workshopId));
-                } else {
-                    // Failure: return a ModDetails object with nulls
-                    return new ModDetails(null, workshopId, null, null);
+                    if (!found) {
+                        // Not found in API response - return null ModDetails
+                        modDetailsList.add(new ModDetails(null, workshopId, null, null));
+                    }
                 }
             }
-        } catch (Exception e) {
-            // If an error occurs, return null for modName and maps
-            System.err.println("Failed to fetch or process URL: " + url);
-        }
-        // Return a default ModDetails object if the fetch failed
-        return new ModDetails(null, workshopId, null, null);
+
+            return modDetailsList;
+        });
     }
 
-    // Helper method to collect mod names from the HTML content
-    private String collectModNames(String html) {
-        Pattern modNamePattern = Pattern.compile("(?i)(Mod ?ID|MID): *(\\w+)");
-        Matcher matcher = modNamePattern.matcher(html);
-        if (matcher.find()) {
-            return matcher.group(2).trim();  // Return the mod name if found
+    /**
+     * Parse Steam API response into ModDetails model.
+     * Handles result codes and extracts data from API response.
+     */
+    private ModDetails parseSteamApiDetails(SteamPublishedFileDetails details) {
+        String workshopId = details.getPublishedfileid();
+
+        // Check for unsuccessful result (1 = success, 9 = not found, others = errors)
+        if (details.getResult() != 1) {
+            return new ModDetails(null, workshopId, null, null);
         }
-        return null;  // Return null if no mod name found
+
+        // Extract thumbnail from preview_url
+        String thumbnailUrl = details.getPreview_url();
+        if (thumbnailUrl == null || thumbnailUrl.isEmpty()) {
+            thumbnailUrl = "/placeholder.svg";
+        }
+
+        // Extract Mod ID and maps from description
+        String description = details.getDescription();
+        String modName = extractModId(description);
+        Set<String> maps = new HashSet<>();
+        if (description != null) {
+            extractMapsFromDescription(description, maps);
+        }
+
+        // If no Mod ID found, we can't use this mod
+        if (modName == null || modName.isEmpty()) {
+            return new ModDetails(null, workshopId, null, null);
+        }
+
+        return new ModDetails(modName, workshopId, List.copyOf(maps), thumbnailUrl);
     }
 
-    // Helper method to collect map names from the HTML content
-    private void collectMaps(String html, Set<String> maps) {
+    /**
+     * Extract Mod ID from description using multiple regex patterns.
+     * Patterns from ZomboidServerSetup reference implementation.
+     */
+    private String extractModId(String description) {
+        if (description == null) {
+            return null;
+        }
+
+        // List of regex patterns to try, in order
+        List<String> patterns = Arrays.asList(
+            // Standard "Mod ID: xyz" formats
+            "(?i)Mod[:\\s]+ID[:\\s]*([a-zA-Z0-9_.\\-\\s]+?)(?:\\n|$)",
+            "(?i)mod[:\\s]+id[:\\s]*([a-zA-Z0-9_.\\-\\s]+?)(?:\\n|$)",
+            "(?i)ModId[:\\s]*([a-zA-Z0-9_.\\-\\s]+?)(?:\\n|$)",
+            "(?i)modid[:\\s]*([a-zA-Z0-9_.\\-\\s]+?)(?:\\n|$)"
+        );
+
+        for (String patternStr : patterns) {
+            Pattern pattern = Pattern.compile(patternStr);
+            Matcher matcher = pattern.matcher(description);
+            if (matcher.find()) {
+                return matcher.group(1).trim();
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Extract map folders from description.
+     * Map patterns remain the same - parse from description text.
+     */
+    private void extractMapsFromDescription(String description, Set<String> maps) {
+        // Existing map patterns
         Pattern mapPattern = Pattern.compile("(?i)(Map ?Folder|Folder|Map): ([\\w. ]+)");
-        Matcher matcher = mapPattern.matcher(html);
+        Matcher matcher = mapPattern.matcher(description);
         while (matcher.find()) {
             maps.add(matcher.group(2).trim());
         }
-    }
-
-    // Method to fetch the thumbnail for the Workshop mod
-    public String getWorkshopThumbnail(String workshopId) {
-        String thumbnailUrl = "/placeholder.svg";  // Default placeholder
-
-        try {
-            String url = modUrlTemplate + workshopId;
-            String htmlContent = restTemplate.getForObject(url, String.class);
-
-            if (htmlContent != null) {
-                Document document = Jsoup.parse(htmlContent);
-                Element imgElement = document.getElementById("previewImageMain");
-
-                if (imgElement != null) {
-                    thumbnailUrl = imgElement.attr("src");
-                }
-            }
-        } catch (Exception e) {
-            System.err.println("Error while fetching the thumbnail for Workshop ID " + workshopId + ": " + e.getMessage());
-        }
-
-        return thumbnailUrl;
-    }
-    private void rateLimit() {
-    try {
-        Thread.sleep(1500); // 1.5 seconds
-    } catch (InterruptedException ignored) {}
     }
 }
